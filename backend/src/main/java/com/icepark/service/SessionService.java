@@ -5,6 +5,7 @@ import com.icepark.entity.Session;
 import com.icepark.enums.SessionStatus;
 import com.icepark.exception.BusinessValidationException;
 import com.icepark.exception.ConflictException;
+import com.icepark.repository.SessionEquipmentRepository;
 import com.icepark.repository.SessionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,6 +22,7 @@ import java.util.stream.Collectors;
 public class SessionService {
 
     private final SessionRepository sessionRepository;
+    private final SessionEquipmentRepository sessionEquipmentRepository;
     private final EquipmentDispatchService equipmentDispatchService;
 
     public List<SessionDTO> getAllSessions() {
@@ -132,6 +134,12 @@ public class SessionService {
         if (equipmentDispatchService.sessionHasOutstanding(id)) {
             throw new ConflictException("场次仍有已领用未归还的器材，请先结束场次完成兜底收回后再删除");
         }
+        if (sessionEquipmentRepository.existsBySessionIdAndDispatchStatusIn(
+                id, java.util.List.of(
+                        com.icepark.enums.BindDispatchStatus.QUARANTINED,
+                        com.icepark.enums.BindDispatchStatus.SCRAPPED))) {
+            throw new ConflictException("场次存在送检隔离或报废留档的器材，送检历史必须保留，不能删除场次");
+        }
         sessionRepository.delete(session);
     }
 
@@ -169,6 +177,12 @@ public class SessionService {
 
     public Session getSessionEntity(Long id) {
         return sessionRepository.findById(id)
+                .orElseThrow(() -> new BusinessValidationException("场次不存在，ID: " + id));
+    }
+
+    /** 绑定/送检等路径先对场次行加悲观写锁（与发装/归还/结束同一把锁） */
+    public Session lockSession(Long id) {
+        return sessionRepository.findByIdForUpdate(id)
                 .orElseThrow(() -> new BusinessValidationException("场次不存在，ID: " + id));
     }
 }

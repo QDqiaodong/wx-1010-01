@@ -30,6 +30,12 @@ public class EquipmentDTO {
     @NotBlank(message = "器材类别不能为空")
     @Size(max = 50, message = "器材类别长度不能超过50")
     private String category;
-    
+
     private String status;
+
+    /** 资产状态中文标签（可用/使用中/送检中/已报废…），前端直接展示 */
+    private String statusLabel;
+
+    /** 当前未关闭送检单ID（无则 null）。列表据此禁用绑定/发装、显示送检入口状态 */
+    private Long openInspectionId;
 }

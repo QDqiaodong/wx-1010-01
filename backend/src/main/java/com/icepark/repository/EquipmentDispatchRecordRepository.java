@@ -24,6 +24,9 @@ public interface EquipmentDispatchRecordRepository extends JpaRepository<Equipme
 
     boolean existsByEquipmentIdAndStatus(Long equipmentId, DispatchStatus status);
 
+    /** 送检"转入待处理"：找到器材当前未归还流水（任何场次至多一条，由 outstanding_key 唯一索引保证） */
+    Optional<EquipmentDispatchRecord> findFirstByEquipmentIdAndStatus(Long equipmentId, DispatchStatus status);
+
     boolean existsByOutstandingKey(String outstandingKey);
 
     /**

@@ -8,7 +8,11 @@ import type {
   AgeGroup,
   SessionDispatchItem,
   EquipmentDispatchRecord,
-  IssueRequest
+  IssueRequest,
+  InspectionOrder,
+  InspectionOrderDetail,
+  InspectionCreateRequest,
+  InspectionActionRequest
 } from '@/types'
 
 const request = axios.create({
@@ -22,6 +26,10 @@ request.interceptors.response.use(responseData, error => {
   console.error('API Error:', error)
   throw error
 })
+
+/** 从 axios 错误中提取后端返回的明确中文原因 */
+export const apiError = (e: any, fallback = '操作失败'): string =>
+  e?.response?.data?.error || e?.message || fallback
 
 export const equipmentApi = {
   getAll: (ageGroup?: string): Promise<Equipment[]> => {
@@ -74,4 +82,31 @@ export const sessionEquipmentApi = {
 export const adjustRecordApi = {
   getAll: (): Promise<AdjustRecord[]> => request.get('/adjust-record'),
   getBySession: (sessionId: number): Promise<AdjustRecord[]> => request.get(`/adjust-record/session/${sessionId}`)
+}
+
+export const inspectionApi = {
+  list: (open?: boolean, equipmentId?: number): Promise<InspectionOrder[]> =>
+    request.get('/inspection', {
+      params: {
+        ...(open === undefined ? {} : { open }),
+        ...(equipmentId === undefined ? {} : { equipmentId })
+      }
+    }),
+  getDetail: (id: number): Promise<InspectionOrderDetail> => request.get(`/inspection/${id}`),
+  listByEquipment: (equipmentId: number): Promise<InspectionOrder[]> =>
+    request.get(`/inspection/equipment/${equipmentId}`),
+  submit: (data: InspectionCreateRequest): Promise<InspectionOrderDetail> =>
+    request.post('/inspection', data),
+  returnMaterials: (id: number, data: InspectionActionRequest): Promise<InspectionOrderDetail> =>
+    request.post(`/inspection/${id}/return-materials`, data),
+  resubmit: (id: number, data: InspectionActionRequest): Promise<InspectionOrderDetail> =>
+    request.post(`/inspection/${id}/resubmit`, data),
+  submitReinspection: (id: number, data: InspectionActionRequest): Promise<InspectionOrderDetail> =>
+    request.post(`/inspection/${id}/reinspect`, data),
+  passReinspection: (id: number, data: InspectionActionRequest): Promise<InspectionOrderDetail> =>
+    request.post(`/inspection/${id}/reinspect/pass`, data),
+  failReinspection: (id: number, data: InspectionActionRequest): Promise<InspectionOrderDetail> =>
+    request.post(`/inspection/${id}/reinspect/fail`, data),
+  scrap: (id: number, data: InspectionActionRequest): Promise<InspectionOrderDetail> =>
+    request.post(`/inspection/${id}/scrap`, data)
 }

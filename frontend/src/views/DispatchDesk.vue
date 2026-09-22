@@ -41,6 +41,8 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const issuedCount = computed(() => items.value.filter(i => i.dispatchStatus === 'ISSUED').length)
 const availableCount = computed(() => items.value.filter(i => i.dispatchStatus === 'AVAILABLE').length)
+const quarantinedCount = computed(() => items.value.filter(i => i.dispatchStatus === 'QUARANTINED').length)
+const scrappedCount = computed(() => items.value.filter(i => i.dispatchStatus === 'SCRAPPED').length)
 
 const ageGroupOptions = Object.entries(AGE_GROUP_MAP).map(([value, data]) => ({
   label: data.label,
@@ -158,8 +160,10 @@ const handleIssue = async () => {
     issueDialogVisible.value = false
     await loadData()
   } catch (e: any) {
-    // 409 并发冲突 / 400 校验失败：后端已给出具体原因，原样展示给工作人员
-    ElMessage({ type: e?.response?.status === 409 ? 'warning' : 'error', message: e?.response?.data?.error || '发装失败' })
+    // 409 并发冲突 / 400 校验失败：后端已给出具体原因，原样展示给工作人员；
+    // 随后静默刷新现场状态（器材被他人送检/报废时本页立即一致），原有流水记录不受影响
+    ElMessage({ type: e?.response?.status === 409 ? 'warning' : 'error', message: e?.response?.data?.error || '发装失败', duration: 6000 })
+    await loadData(true)
   } finally {
     issuing.value = false
   }
@@ -190,7 +194,18 @@ const dispatchTagType = (status: string) =>
     ? 'warning'
     : status === 'RETURNED'
       ? 'success'
-      : 'info'
+      : status === 'TRANSFERRED_PENDING'
+        ? 'danger'
+        : 'info'
+
+const bindTagType = (status: string) =>
+  status === 'ISSUED'
+    ? 'warning'
+    : status === 'QUARANTINED'
+      ? 'danger'
+      : status === 'SCRAPPED'
+        ? 'info'
+        : 'success'
 
 const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
 </script>
@@ -232,7 +247,12 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
             <el-tag :type="inProgress ? 'success' : 'info'" class="ml">
               {{ SESSION_STATUS_MAP[currentSession.status] }}
             </el-tag>
-            <span class="ml">在架 <b>{{ availableCount }}</b> 件 / 已领用 <b>{{ issuedCount }}</b> 件</span>
+            <span class="ml">在架 <b>{{ availableCount }}</b> 件 / 已领用 <b>{{ issuedCount }}</b> 件
+              <template v-if="quarantinedCount || scrappedCount">
+                / <el-tag size="small" type="danger" class="ml">送检隔离 {{ quarantinedCount }}</el-tag>
+                <el-tag size="small" type="info" class="ml">报废 {{ scrappedCount }}</el-tag>
+              </template>
+            </span>
             <div class="spacer" />
             <el-button
               v-if="currentSession.status === 'SCHEDULED'"
@@ -296,11 +316,29 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="发装状态" width="100">
+          <el-table-column label="发装状态" width="110">
             <template #default="{ row }">
-              <el-tag :type="row.dispatchStatus === 'ISSUED' ? 'warning' : 'success'">
+              <el-tag :type="bindTagType(row.dispatchStatus)">
                 {{ row.dispatchStatusLabel }}
               </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="资产状态" width="100">
+            <template #default="{ row }">
+              <el-tag
+                v-if="row.equipmentStatus"
+                size="small"
+                :type="row.equipmentStatus === 'INSPECTION'
+                  ? 'danger'
+                  : row.equipmentStatus === 'SCRAPPED'
+                    ? 'info'
+                    : row.equipmentStatus === 'AVAILABLE'
+                      ? 'success'
+                      : 'warning'"
+              >
+                {{ row.equipmentStatusLabel }}
+              </el-tag>
+              <span v-else class="muted">—</span>
             </template>
           </el-table-column>
           <el-table-column label="当前使用游客" min-width="180">
@@ -308,6 +346,14 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
               <template v-if="row.dispatchStatus === 'ISSUED'">
                 {{ row.activeVisitorName }}
                 <el-tag size="small" class="ml">{{ row.activeVisitorAgeGroupLabel }}</el-tag>
+              </template>
+              <template v-else-if="row.dispatchStatus === 'QUARANTINED'">
+                <el-tag size="small" type="danger">
+                  已送检{{ row.openInspectionId ? ` #${row.openInspectionId}` : '' }}，复检通过后恢复可发装
+                </el-tag>
+              </template>
+              <template v-else-if="row.dispatchStatus === 'SCRAPPED'">
+                <el-tag size="small" type="info">已报废，本行仅留档</el-tag>
               </template>
               <span v-else class="muted">—</span>
             </template>
@@ -322,12 +368,15 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
                 @click="openIssueDialog(row)"
               >发装</el-button>
               <el-button
-                v-else
+                v-else-if="row.dispatchStatus === 'ISSUED'"
                 size="small"
                 type="success"
                 :loading="returningId === row.activeRecordId"
                 @click="handleReturn(row)"
               >归还</el-button>
+              <span v-else class="muted">
+                {{ row.dispatchStatus === 'QUARANTINED' ? '维修/复检中' : '已报废' }}
+              </span>
             </template>
           </el-table-column>
         </el-table>

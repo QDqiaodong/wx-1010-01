@@ -28,4 +28,12 @@ public interface SessionRepository extends JpaRepository<Session, Long> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT s FROM Session s WHERE s.id = :id")
     Optional<Session> findByIdForUpdate(@Param("id") Long id);
+
+    /**
+     * 送检器材时按ID升序锁定它所绑定的全部场次行，与发装/归还/结束路径使用相同的锁层级。
+     * 调用方必须先把ID排序，保证多场次之间也按固定顺序加锁、不会交叉死锁。
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT s FROM Session s WHERE s.id IN :ids ORDER BY s.id ASC")
+    List<Session> findByIdsForUpdate(@Param("ids") List<Long> ids);
 }

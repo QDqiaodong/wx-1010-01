@@ -8,6 +8,7 @@ const menuItems = [
   { path: '/equipment', label: '器材管理' },
   { path: '/session', label: '场次管理' },
   { path: '/dispatch', label: '入场发装台' },
+  { path: '/inspection', label: '器材送检台' },
   { path: '/adjust', label: '客群调整' },
   { path: '/summary', label: '年龄分组汇总' }
 ]

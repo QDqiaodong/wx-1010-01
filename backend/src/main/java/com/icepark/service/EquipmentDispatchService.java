@@ -48,14 +48,17 @@ public class EquipmentDispatchService {
     private final SessionEquipmentRepository sessionEquipmentRepository;
     private final EquipmentRepository equipmentRepository;
     private final EquipmentDispatchRecordRepository dispatchRecordRepository;
+    private final InspectionOrderService inspectionOrderService;
 
     /**
      * 发装：把某一件具体器材发给某一位游客。
      *
-     * 并发保证（三道，均在后端/数据库，不依赖前端）：
-     * 1) 先对场次行加悲观写锁，同一场次的所有发装/归还/结束串行化，顺带消除"发装中途场次被结束"竞态；
+     * 并发保证（均在后端/数据库，不依赖前端）：
+     * 1) 先对场次行加悲观写锁，同一场次的所有发装/归还/结束串行化；送检路径也按"场次行优先
+     *    （一件器材涉及多个场次时按ID升序）→ 绑定行 → 器材行"加锁，全局锁序一致，不会交叉死锁；
      * 2) 绑定状态做条件 UPDATE（CAS：仅在架可置已领用），影响行数 0 即判定已被领用；
-     * 3) 流水表 outstanding_key 唯一索引兜底跨场次/异常路径，同一件器材任何时刻至多一条未归还流水。
+     * 3) 流水表 outstanding_key 唯一索引兜底跨场次/异常路径，同一件器材任何时刻至多一条未归还流水；
+     * 4) 器材资产状态复检：已送检/已报废的器材即使旧页面未刷新也会在这里被挡住，不会覆盖新状态。
      */
     @Transactional
     public EquipmentDispatchRecordDTO issue(Long sessionId, IssueRequestDTO request) {
@@ -75,6 +78,25 @@ public class EquipmentDispatchService {
 
         Equipment equipment = equipmentRepository.findById(request.getEquipmentId())
                 .orElseThrow(() -> new BusinessValidationException("器材不存在，ID: " + request.getEquipmentId()));
+
+        // 资产状态守卫：送检/报废后旧页面未刷新提交发装时，明确拒绝并提示刷新（不覆盖新状态）
+        if (equipment.getStatus() == EquipmentStatus.INSPECTION) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                    + "」已被送检（维修/复检中），不能发装；请刷新页面，该器材状态已更新");
+        }
+        if (equipment.getStatus() == EquipmentStatus.SCRAPPED) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                    + "」已报废，不能发装；请刷新页面");
+        }
+        // 绑定行隔离态守卫：CAS 本就会失败，这里先给出明确的中文提示
+        if (binding.getDispatchStatus() == BindDispatchStatus.QUARANTINED) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode()
+                    + "」已送检隔离，不能发装；请刷新页面");
+        }
+        if (binding.getDispatchStatus() == BindDispatchStatus.SCRAPPED) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode()
+                    + "」已报废留档，不能发装；请刷新页面");
+        }
 
         AgeGroup visitorAgeGroup = parseAgeGroup(request.getVisitorAgeGroup());
 
@@ -101,6 +123,16 @@ public class EquipmentDispatchService {
         int updated = sessionEquipmentRepository.markIssuedIfAvailable(
                 binding.getId(), BindDispatchStatus.ISSUED, BindDispatchStatus.AVAILABLE);
         if (updated == 0) {
+            BindDispatchStatus now = sessionEquipmentRepository.findById(binding.getId())
+                    .map(SessionEquipment::getDispatchStatus).orElse(null);
+            if (now == BindDispatchStatus.QUARANTINED) {
+                throw new ConflictException("器材「" + equipment.getEquipmentCode()
+                        + "」已被送检隔离，不能发装；请刷新页面");
+            }
+            if (now == BindDispatchStatus.SCRAPPED) {
+                throw new ConflictException("器材「" + equipment.getEquipmentCode()
+                        + "」已报废，不能发装；请刷新页面");
+            }
             throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
                     + "」已被其他工作人员领用，本次发装失败");
         }
@@ -150,6 +182,11 @@ public class EquipmentDispatchService {
         if (record.getStatus() == DispatchStatus.RETURNED) {
             throw new BusinessValidationException("该器材已于 " + record.getReturnTime() + " 归还，请勿重复归还");
         }
+        if (record.getStatus() == DispatchStatus.TRANSFERRED_PENDING) {
+            throw new BusinessValidationException(
+                    "该器材送检时已按「转入待处理」收回（操作人：" + record.getReturnOperator()
+                            + "），无需再归还，请在送检台跟进维修进度");
+        }
         if (record.getStatus() == DispatchStatus.AUTO_CLOSED) {
             throw new BusinessValidationException(
                     "场次「" + session.getSessionName() + "」已结束，该器材在结束时已由系统兜底收回，无需再归还");
@@ -158,8 +195,8 @@ public class EquipmentDispatchService {
         int closed = dispatchRecordRepository.closeRecord(
                 recordId, DispatchStatus.RETURNED, operator, LocalDateTime.now());
         if (closed == 0) {
-            // 并发归还：closeRecord 带条件 status=ISSUED，只有一个请求能更新成功
-            throw new ConflictException("该归还请求已被其他工作人员处理，本次操作未重复执行");
+            // 并发归还/转入待处理：closeRecord 带条件 status=ISSUED，只有一个请求能更新成功
+            throw new ConflictException("该归还请求已被其他工作人员处理（可能已归还或送检转入待处理），本次操作未重复执行");
         }
 
         int bindingUpdated = sessionEquipmentRepository.markAvailableIfIssued(
@@ -215,11 +252,16 @@ public class EquipmentDispatchService {
         List<SessionEquipment> bindings = sessionEquipmentRepository.findBySessionId(sessionId);
         List<Long> equipmentIds = bindings.stream().map(SessionEquipment::getEquipmentId).toList();
 
-        Map<Long, Equipment> equipmentMap = equipmentRepository.findAllById(equipmentIds).stream()
-                .collect(Collectors.toMap(Equipment::getId, Function.identity()));
+        Map<Long, Equipment> equipmentMap = equipmentIds.isEmpty()
+                ? Map.of()
+                : equipmentRepository.findAllById(equipmentIds).stream()
+                        .collect(Collectors.toMap(Equipment::getId, Function.identity()));
         Map<Long, EquipmentDispatchRecord> activeMap = dispatchRecordRepository
                 .findBySessionIdAndStatus(sessionId, DispatchStatus.ISSUED).stream()
                 .collect(Collectors.toMap(EquipmentDispatchRecord::getEquipmentId, Function.identity()));
+        Map<Long, com.icepark.entity.InspectionOrder> openInspectionMap = equipmentIds.isEmpty()
+                ? Map.of()
+                : inspectionOrderService.mapOpenOrders(equipmentIds);
 
         List<SessionDispatchItemDTO> result = new ArrayList<>();
         for (SessionEquipment binding : bindings) {
@@ -240,6 +282,13 @@ public class EquipmentDispatchService {
                 dto.setCategory(equipment.getCategory());
                 dto.setFrostResistanceSpec(equipment.getFrostResistanceSpec());
                 dto.setFrostLowerLimit(FrostSpecParser.parseLowerLimit(equipment.getFrostResistanceSpec()));
+                // 资产级状态同步给现场页：送检中/已报废时旧页面也能在下次刷新看到一致状态
+                dto.setEquipmentStatus(equipment.getStatus());
+                dto.setEquipmentStatusLabel(equipment.getStatus().getLabel());
+            }
+            com.icepark.entity.InspectionOrder openOrder = openInspectionMap.get(binding.getEquipmentId());
+            if (openOrder != null) {
+                dto.setOpenInspectionId(openOrder.getId());
             }
 
             EquipmentDispatchRecord active = activeMap.get(binding.getEquipmentId());
@@ -298,10 +347,17 @@ public class EquipmentDispatchService {
         return dispatchRecordRepository.existsBySessionIdAndStatus(sessionId, DispatchStatus.ISSUED);
     }
 
-    /** 兜底收回后，器材若不再被其他场次绑定，资产状态复位为可用（可被新场次自动/手动绑定） */
+    /** 兜底收回后，只有未送检/未报废的器材才复位资产状态：
+     *  送检中（INSPECTION）保持送检流程，已报废（SCRAPPED）保持报废，不能被场次结束悄悄改回可用 */
     private void resetEquipmentIfFree(Long equipmentId, Long endedSessionId) {
         Equipment equipment = equipmentRepository.findById(equipmentId).orElse(null);
         if (equipment == null) {
+            return;
+        }
+        if (equipment.getStatus() == EquipmentStatus.INSPECTION
+                || equipment.getStatus() == EquipmentStatus.SCRAPPED) {
+            log.info("场次{}结束，器材{}当前资产状态为{}，不做复位",
+                    endedSessionId, equipmentId, equipment.getStatus());
             return;
         }
         boolean boundElsewhere = sessionEquipmentRepository.findByEquipmentId(equipmentId).stream()

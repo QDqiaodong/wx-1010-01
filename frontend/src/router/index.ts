@@ -26,6 +26,11 @@ const routes = [
     component: () => import('@/views/DispatchDesk.vue')
   },
   {
+    path: '/inspection',
+    name: 'inspection',
+    component: () => import('@/views/InspectionDesk.vue')
+  },
+  {
     path: '/adjust',
     name: 'adjust',
     component: () => import('@/views/AdjustManagement.vue')

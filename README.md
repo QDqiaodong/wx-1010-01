@@ -53,3 +53,30 @@ cd .. && docker compose up -d --build
 
 后端测试：`cd backend && mvn test`（含 8 线程并发领用、并发归还、临界气温、双校验、场次结束兜底、兜底后新场次重新领用等 17 个用例，使用 H2 MySQL 模式验证真实数据库锁与唯一约束行为）。
 
+## 器材送检台（送检 → 维修 → 复检 → 放行/报废闭环）
+
+独立操作页：前端菜单「器材送检台」（路由 `/inspection`，器材列表行内「送检」按钮可带 `?equipmentId=` 预选器材）。
+
+把现场发现异常的器材送去维修、复检并重新放回可用池，状态流与留痕全部在后端/数据库保证：
+
+1. **送检单状态机**：`SUBMITTED 待维修` →（维修退回补充材料）`MATERIAL_NEEDED 待补充材料` →（补齐）`SUBMITTED` →（维修完成提交复检）`REINSPECTING 复检中` → `CLOSED_PASSED 复检通过关闭`；复检不通过退回 `SUBMITTED` 可反复维修复检；任意待维修/待补料/复检中环节均可 `CLOSED_SCRAPPED 报废关闭`。终态单据不可再改，再次送检必须新建单据。
+2. **重复送检互斥**：`inspection_order.open_key` 未关闭期间写 `"inspection:{equipmentId}"` 并配唯一索引，同一件器材任何时刻至多一张未关闭送检单；应用层先查给出带单号的中文 409 提示，唯一索引兜底并发（含 6 线程并发送检测试）。
+3. **历史不覆盖**：每次操作（提交/退补/补齐/提交复检/复检通过/不通过/报废）向 `inspection_event` 追加一条痕迹（操作人、说明、前后状态、时间），后一次复检不覆盖此前维修与退回记录，详情页按时间线完整回溯。
+4. **已发给游客的器材**：送检时可先按当前流水正常归还；无法归还时勾选「转入待处理」，流水置为 `TRANSFERRED_PENDING 转入待处理`（记录发现人）、绑定行隔离，再进入维修——不会留下既不能归还又不能维修的悬空记录。转入待处理后不能再重复归还。
+5. **送检期间不可绑定/发装**：器材资产置为 `INSPECTION 送检中`，既有场次绑定行置为 `QUARANTINED 送检隔离`；手动/自动绑定、现场发装全部由后端拒绝（409 明确提示刷新），旧页面停留期间提交也不会覆盖新状态，原有发装流水保留。
+6. **复检通过重新放行**：隔离绑定复位在架（进行中场次立即可再发装），器材无绑定时回 `AVAILABLE 可用`、仍绑定时回 `IN_USE 使用中`；场次结束兜底不会把送检中器材错误复位为可用。
+7. **报废**：资产置 `SCRAPPED 已报废` 且必须填报废理由，绑定行转为 `SCRAPPED 已报废留档`（不删除），从可绑定/可发装清单永久消失；有送检历史的器材禁止物理删除。
+8. **加锁顺序**：送检与发装/归还/结束场次统一按「场次行（多场次按ID升序）→ 绑定行 → 器材行」加悲观写锁，附 20 轮「发装 vs 送检」竞争测试验证无死锁、无锁超时。
+
+接口（`/api/inspection`）：
+
+- `POST /api/inspection`：提交送检（equipmentId、reporter、problemDescription、forceTransfer）
+- `POST /api/inspection/{id}/return-materials` / `/resubmit` / `/reinspect`
+- `POST /api/inspection/{id}/reinspect/pass` / `/reinspect/fail`
+- `POST /api/inspection/{id}/scrap`（报废理由必填）
+- `GET /api/inspection?open=true|false` / `GET /api/inspection/{id}`（含操作痕迹）/ `GET /api/inspection/equipment/{equipmentId}`
+
+发装流水新增状态 `TRANSFERRED_PENDING 转入待处理`；器材资产状态新增 `INSPECTION 送检中`、`SCRAPPED 已报废`；绑定发装状态新增 `QUARANTINED 送检隔离`、`SCRAPPED 已报废留档`。
+
+后端测试共 34 个用例（`mvn test`），其中送检链路 17 个：重复送检、并发送检、转入待处理、送检期间归还、场次结束不复活、退补材料、复检不通过、复检通过再发装/再送检、报废不可绑定发装、发装vs送检无死锁等，均用 H2 MySQL 模式验证真实约束。
+

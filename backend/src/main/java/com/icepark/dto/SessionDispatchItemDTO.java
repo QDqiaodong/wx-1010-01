@@ -29,6 +29,13 @@ public class SessionDispatchItemDTO {
     private BindDispatchStatus dispatchStatus;
     private String dispatchStatusLabel;
 
+    /** 器材资产级状态（送检中/已报废时即使旧页面停留在本页也不能发装） */
+    private com.icepark.enums.EquipmentStatus equipmentStatus;
+    private String equipmentStatusLabel;
+
+    /** 当前未关闭送检单ID（送检隔离时有值，前端给出明确提示） */
+    private Long openInspectionId;
+
     /** 当前未归还流水ID（在架时为 null），归还直接用它 */
     private Long activeRecordId;
     private String activeVisitorName;
