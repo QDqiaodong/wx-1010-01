@@ -5,12 +5,15 @@ import com.icepark.dto.IssueRequestDTO;
 import com.icepark.dto.SessionDispatchItemDTO;
 import com.icepark.entity.Equipment;
 import com.icepark.entity.EquipmentDispatchRecord;
+import com.icepark.entity.InspectionOrder;
 import com.icepark.entity.Session;
 import com.icepark.entity.SessionEquipment;
 import com.icepark.enums.AgeGroup;
 import com.icepark.enums.BindDispatchStatus;
 import com.icepark.enums.DispatchStatus;
 import com.icepark.enums.EquipmentStatus;
+import com.icepark.enums.InspectionActionType;
+import com.icepark.enums.InspectionStatus;
 import com.icepark.enums.SessionStatus;
 import com.icepark.exception.BusinessValidationException;
 import com.icepark.exception.ConflictException;
@@ -48,6 +51,7 @@ public class EquipmentDispatchService {
     private final SessionEquipmentRepository sessionEquipmentRepository;
     private final EquipmentRepository equipmentRepository;
     private final EquipmentDispatchRecordRepository dispatchRecordRepository;
+    private final InspectionService inspectionService;
 
     /**
      * 发装：把某一件具体器材发给某一位游客。
@@ -73,8 +77,11 @@ public class EquipmentDispatchService {
                 .orElseThrow(() -> new BusinessValidationException(
                         "该器材未绑定到本场次，无法发装（equipmentId=" + request.getEquipmentId() + "）"));
 
-        Equipment equipment = equipmentRepository.findById(request.getEquipmentId())
+        // 统一加锁顺序：场次行锁 -> 器材行锁。旧页面停留期间器材被送检/报废时，
+        // 这里读到的是最新资产状态，提交发装不会覆盖新状态
+        Equipment equipment = equipmentRepository.findByIdForUpdate(request.getEquipmentId())
                 .orElseThrow(() -> new BusinessValidationException("器材不存在，ID: " + request.getEquipmentId()));
+        assertEquipmentIssuable(equipment, binding);
 
         AgeGroup visitorAgeGroup = parseAgeGroup(request.getVisitorAgeGroup());
 
@@ -101,6 +108,12 @@ public class EquipmentDispatchService {
         int updated = sessionEquipmentRepository.markIssuedIfAvailable(
                 binding.getId(), BindDispatchStatus.ISSUED, BindDispatchStatus.AVAILABLE);
         if (updated == 0) {
+            BindDispatchStatus bindingNow = sessionEquipmentRepository.findById(binding.getId())
+                    .map(SessionEquipment::getDispatchStatus).orElse(null);
+            if (bindingNow == BindDispatchStatus.PENDING) {
+                throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                        + "」已被送检冻结，本次发装未执行，请刷新查看");
+            }
             throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
                     + "」已被其他工作人员领用，本次发装失败");
         }
@@ -154,6 +167,10 @@ public class EquipmentDispatchService {
             throw new BusinessValidationException(
                     "场次「" + session.getSessionName() + "」已结束，该器材在结束时已由系统兜底收回，无需再归还");
         }
+        if (record.getStatus() == DispatchStatus.PENDING_TRANSFER) {
+            throw new BusinessValidationException(
+                    "该器材已随送检单转入待处理，原流水已闭环，不能再归还");
+        }
 
         int closed = dispatchRecordRepository.closeRecord(
                 recordId, DispatchStatus.RETURNED, operator, LocalDateTime.now());
@@ -162,18 +179,23 @@ public class EquipmentDispatchService {
             throw new ConflictException("该归还请求已被其他工作人员处理，本次操作未重复执行");
         }
 
+        EquipmentDispatchRecord refreshedRecord =
+                dispatchRecordRepository.findById(recordId).orElseThrow();
         int bindingUpdated = sessionEquipmentRepository.markAvailableIfIssued(
-                record.getSessionEquipmentId(), BindDispatchStatus.ISSUED, BindDispatchStatus.AVAILABLE);
+                refreshedRecord.getSessionEquipmentId(), BindDispatchStatus.ISSUED, BindDispatchStatus.AVAILABLE);
         if (bindingUpdated == 0) {
             // 正常情况下与流水状态一致；不一致说明数据被异常改动，明确提示人工核查
             throw new ConflictException("器材绑定状态与流水状态不一致，请刷新后联系管理员核查");
         }
 
-        EquipmentDispatchRecord refreshed = dispatchRecordRepository.findById(recordId).orElseThrow();
-        Equipment equipment = equipmentRepository.findById(refreshed.getEquipmentId()).orElse(null);
+        // 送检期间归还：若该器材有待归还送检单，单据推进维修队列并重新冻结绑定行（资产保持送检中）
+        inspectionService.onOutstandingRecordClosed(
+                refreshedRecord, InspectionActionType.RETURN_WHILE_PENDING);
+
+        Equipment equipment = equipmentRepository.findById(refreshedRecord.getEquipmentId()).orElse(null);
         log.info("归还成功: 场次{} 流水{} 器材{} 操作员{}", sessionId, recordId,
-                refreshed.getEquipmentId(), operator);
-        return toRecordDTO(refreshed, equipment);
+                refreshedRecord.getEquipmentId(), operator);
+        return toRecordDTO(refreshedRecord, equipment);
     }
 
     /**
@@ -195,12 +217,21 @@ public class EquipmentDispatchService {
                     record.getId(), DispatchStatus.AUTO_CLOSED,
                     operator != null ? operator : FALLBACK_OPERATOR, now);
             if (closed > 0) {
+                EquipmentDispatchRecord refreshedRecord =
+                        dispatchRecordRepository.findById(record.getId()).orElse(record);
                 sessionEquipmentRepository.markAvailableIfIssued(
-                        record.getSessionEquipmentId(), BindDispatchStatus.ISSUED, BindDispatchStatus.AVAILABLE);
-                resetEquipmentIfFree(record.getEquipmentId(), session.getId());
-                log.warn("场次结束兜底收回: 场次{} 器材{} 原领用人{}({}) 发装时间{}",
-                        session.getId(), record.getEquipmentId(),
-                        record.getVisitorName(), record.getVisitorAgeGroup(), record.getIssueTime());
+                        refreshedRecord.getSessionEquipmentId(), BindDispatchStatus.ISSUED, BindDispatchStatus.AVAILABLE);
+
+                // 器材已送检（待归还）：单据推进维修队列并重新冻结绑定行，资产保持送检中，绝不复位可用
+                boolean underInspection = inspectionService.onOutstandingRecordClosed(
+                        refreshedRecord, InspectionActionType.SESSION_AUTO_CLOSE);
+                if (!underInspection) {
+                    resetEquipmentIfFree(refreshedRecord.getEquipmentId(), session.getId());
+                }
+                log.warn("场次结束兜底收回: 场次{} 器材{} 原领用人{}({}) 发装时间{} 送检中={}",
+                        session.getId(), refreshedRecord.getEquipmentId(),
+                        refreshedRecord.getVisitorName(), refreshedRecord.getVisitorAgeGroup(),
+                        refreshedRecord.getIssueTime(), underInspection);
             }
         }
         return outstanding.size();
@@ -221,6 +252,10 @@ public class EquipmentDispatchService {
                 .findBySessionIdAndStatus(sessionId, DispatchStatus.ISSUED).stream()
                 .collect(Collectors.toMap(EquipmentDispatchRecord::getEquipmentId, Function.identity()));
 
+        List<InspectionOrder> openOrders = inspectionService.findOpenOrdersByEquipmentIds(equipmentIds);
+        Map<Long, InspectionOrder> openOrderMap = openOrders.stream()
+                .collect(Collectors.toMap(InspectionOrder::getEquipmentId, Function.identity()));
+
         List<SessionDispatchItemDTO> result = new ArrayList<>();
         for (SessionEquipment binding : bindings) {
             Equipment equipment = equipmentMap.get(binding.getEquipmentId());
@@ -231,8 +266,6 @@ public class EquipmentDispatchService {
             dto.setTargetAgeGroupLabel(binding.getTargetAgeGroup().getLabel());
             BindDispatchStatus status = binding.getDispatchStatus() != null
                     ? binding.getDispatchStatus() : BindDispatchStatus.AVAILABLE;
-            dto.setDispatchStatus(status);
-            dto.setDispatchStatusLabel(status.getLabel());
 
             if (equipment != null) {
                 dto.setEquipmentCode(equipment.getEquipmentCode());
@@ -240,18 +273,39 @@ public class EquipmentDispatchService {
                 dto.setCategory(equipment.getCategory());
                 dto.setFrostResistanceSpec(equipment.getFrostResistanceSpec());
                 dto.setFrostLowerLimit(FrostSpecParser.parseLowerLimit(equipment.getFrostResistanceSpec()));
+                dto.setEquipmentStatus(equipment.getStatus());
+                dto.setEquipmentStatusLabel(equipment.getStatus().getLabel());
+            }
+
+            InspectionOrder openOrder = openOrderMap.get(binding.getEquipmentId());
+            if (openOrder != null) {
+                dto.setInspectionOrderId(openOrder.getId());
+                dto.setInspectionStatusLabel(openOrder.getStatus().getLabel());
+                // 资产/送检状态是权威来源：有未关闭送检单时绑定行一律按冻结展示
+                status = BindDispatchStatus.PENDING;
             }
 
             EquipmentDispatchRecord active = activeMap.get(binding.getEquipmentId());
-            if (active != null) {
+            if (active != null && openOrder != null
+                    && openOrder.getStatus() == InspectionStatus.PENDING_RETURN) {
+                // 待归还送检单且本场次正是持有未归还流水的场次：
+                // 游客还拿着器材，现场仍需能按原流水归还/转入待处理
+                dto.setActiveRecordId(active.getId());
+                dto.setActiveVisitorName(active.getVisitorName());
+                dto.setActiveVisitorAgeGroup(active.getVisitorAgeGroup());
+                dto.setActiveVisitorAgeGroupLabel(active.getVisitorAgeGroup().getLabel());
+                status = BindDispatchStatus.ISSUED;
+            } else if (active != null && openOrder == null) {
                 dto.setActiveRecordId(active.getId());
                 dto.setActiveVisitorName(active.getVisitorName());
                 dto.setActiveVisitorAgeGroup(active.getVisitorAgeGroup());
                 dto.setActiveVisitorAgeGroupLabel(active.getVisitorAgeGroup().getLabel());
                 // 数据一致性兜底：若绑定状态因故没落为 ISSUED，以未归还流水为准
-                dto.setDispatchStatus(BindDispatchStatus.ISSUED);
-                dto.setDispatchStatusLabel(BindDispatchStatus.ISSUED.getLabel());
+                status = BindDispatchStatus.ISSUED;
             }
+
+            dto.setDispatchStatus(status);
+            dto.setDispatchStatusLabel(status.getLabel());
             result.add(dto);
         }
         return result;
@@ -275,11 +329,35 @@ public class EquipmentDispatchService {
                 .toList();
     }
 
-    /** 绑定/自动绑定时调用：器材有未归还发装时不允许再绑定到任何场次 */
+    /** 绑定/自动绑定时调用：器材有未归还发装或存在未关闭送检单时不允许再绑定到任何场次 */
     @Transactional(readOnly = true)
     public void assertEquipmentNotOutstanding(Long equipmentId) {
         if (dispatchRecordRepository.existsByEquipmentIdAndStatus(equipmentId, DispatchStatus.ISSUED)) {
             throw new ConflictException("该器材已在进行中的场次发给游客且尚未归还，不能绑定到新场次");
+        }
+    }
+
+    /**
+     * 发装前的资产状态守卫（调用方已持有器材行锁）：
+     * 送检中/已报废/维护中的器材一律不能发装，提示中带具体状态与单号。
+     */
+    private void assertEquipmentIssuable(Equipment equipment, SessionEquipment binding) {
+        EquipmentStatus status = equipment.getStatus();
+        if (status == EquipmentStatus.SCRAPPED) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                    + "」已报废，不能发装");
+        }
+        if (status == EquipmentStatus.INSPECTION) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                    + "」已送检，不能发装，请等待维修复检结论");
+        }
+        if (status == EquipmentStatus.MAINTENANCE) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                    + "」处于维护中，不能发装");
+        }
+        if (binding.getDispatchStatus() == BindDispatchStatus.PENDING) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode() + " " + equipment.getName()
+                    + "」已被送检冻结，不能发装（请等待复检通过放行）");
         }
     }
 
@@ -296,6 +374,11 @@ public class EquipmentDispatchService {
 
     public boolean sessionHasOutstanding(Long sessionId) {
         return dispatchRecordRepository.existsBySessionIdAndStatus(sessionId, DispatchStatus.ISSUED);
+    }
+
+    /** 委托：器材是否存在未关闭送检单（自动绑定并发兜底用） */
+    public boolean hasOpenInspection(Long equipmentId) {
+        return inspectionService.hasOpenInspection(equipmentId);
     }
 
     /** 兜底收回后，器材若不再被其他场次绑定，资产状态复位为可用（可被新场次自动/手动绑定） */

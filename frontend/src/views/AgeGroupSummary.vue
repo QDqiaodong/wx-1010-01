@@ -51,7 +51,7 @@ const getAgeGroupColor = (ageGroup: string) => {
             <el-table-column prop="category" label="类别" width="100" />
             <el-table-column prop="status" label="状态" width="80">
               <template #default="scope">
-                <el-tag :type="{ AVAILABLE: 'success', IN_USE: 'warning', MAINTENANCE: 'danger' }[scope.row.status as keyof typeof EQUIPMENT_STATUS_MAP]" size="small">
+                <el-tag :type="{ AVAILABLE: 'success', IN_USE: 'warning', MAINTENANCE: 'info', INSPECTION: 'danger', SCRAPPED: 'info' }[scope.row.status as keyof typeof EQUIPMENT_STATUS_MAP]" size="small">
                   {{ EQUIPMENT_STATUS_MAP[scope.row.status as keyof typeof EQUIPMENT_STATUS_MAP] }}
                 </el-tag>
               </template>

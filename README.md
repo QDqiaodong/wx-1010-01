@@ -45,11 +45,53 @@ cd .. && docker compose up -d --build
 
 接口（均在 `/api/session/{sessionId}/dispatch` 下）：
 
-- `GET /items`：现场视图（绑定器材 + 当前发装状态 + 当前使用游客）
+- `GET /items`：现场视图（绑定器材 + 当前发装状态 + 当前使用游客 + 资产/送检状态）
 - `GET /records`：按场次查发装/归还流水
 - `POST /issue`：发装（请求体含 equipmentId、visitorName、visitorAgeGroup、temperature、operator）
 - `POST /records/{recordId}/return`：归还（请求体含 operator）
 - 场次状态：`POST /api/session/{id}/start`、`POST /api/session/{id}/end`
 
 后端测试：`cd backend && mvn test`（含 8 线程并发领用、并发归还、临界气温、双校验、场次结束兜底、兜底后新场次重新领用等 17 个用例，使用 H2 MySQL 模式验证真实数据库锁与唯一约束行为）。
+
+## 器材送检台（送检—维修—复检—报废—重新可用）
+
+独立操作页：前端菜单「器材送检台」（路由 `/inspection`，器材管理页「送检」按钮可带参直达登记弹窗）。
+
+资产状态在原有 可用/使用中/维护中 基础上新增：**送检中 INSPECTION**、**已报废 SCRAPPED**。送检单状态机：
+
+```
+登记送检 ──器材在架──▶ 待维修 SUBMITTED ──提交复检──▶ 复检中 REINSPECTING ──通过──▶ 复检通过 PASSED（回可用池）
+  │                       │  ▲                            │
+  │                  退回补材料│  │补充后重提              不通过（退回维修，留痕）
+  │                       ▼  │
+  │                  待补充材料 INFO_NEEDED
+  │
+  └──器材已发游客──▶ 待归还 PENDING_RETURN ──游客正常归还 / 场次结束兜底 / 显式转入待处理──▶ 待维修
+                         任意在库维修阶段 ──判定报废──▶ 已报废 SCRAPPED
+```
+
+关键约束（全部在后端 + 数据库保证，不依赖前端禁用按钮）：
+
+1. **同一器材至多一张未关闭送检单**：登记时先对器材行加悲观写锁串行化，`inspection_order.open_key`（`inspect:{equipmentId}`，关闭置 NULL）唯一索引兜底；并发送检只有一张成功，其余收到 409「不能重复送检」。
+2. **送检即冻结**：器材置送检中、全部场次绑定行 CAS 置「送检冻结 PENDING」，不能再被新场次绑定或发装；发装/绑定都持器材行锁读最新状态，旧页面停留期间器材被送检/报废时提交只会收到 409 明确提示，不覆盖新状态、不破坏原有流水。
+3. **不悬空**：已发给游客的器材允许先登记（待归还 PENDING_RETURN）——游客可按**原流水正常归还**（归还时单据自动进维修队列、绑定行重新冻结）；场次结束兜底同样推进单据；游客确认无法归还时可「转入待处理」，发装流水置 `PENDING_TRANSFER` 闭环并释放未归还互斥键，不存在既不能归还又不能维修的记录。
+4. **历史不覆盖**：每次状态变化向 `inspection_action_log` 追加一条痕迹（操作人、前后状态、备注、关联流水）；问题描述创建后不可改，补充材料以痕迹追加；复检不通过退回维修可再次复检；复检通过后再出问题另开新单，旧单完整保留。
+5. **报废**：必须填报废原因；报废器材保留全部送检/发装历史，但从可绑定清单、自动绑定和发装中消失，且不能再送检；有历史流水/送检单的器材禁止物理删除。资产状态不能通过器材编辑表单直接修改。
+6. **复检通过重新放行**：冻结的绑定行恢复在架；器材仍被场次绑定则资产置使用中，否则复位可用，立即恢复绑定/发装资格。
+
+接口（均在 `/api/inspection` 下）：
+
+- `GET /orders?equipmentId=&status=&openOnly=`：送检单查询（默认未关闭）
+- `GET /orders/{id}`：送检单详情（含完整操作痕迹）
+- `POST /equipment/{equipmentId}`：登记送检（problemDescription、reporter）
+- `POST /orders/{id}/transfer-pending`：转入待处理（handler、remark）
+- `POST /orders/{id}/request-info`：退回补充材料（handler、remark 必填）
+- `POST /orders/{id}/resubmit`：补充材料后重新提交（handler、remark 必填）
+- `POST /orders/{id}/submit-reinspection`：提交复检（handler、remark 选填）
+- `POST /orders/{id}/reinspection-pass`：复检通过放行（handler、remark 选填）
+- `POST /orders/{id}/reinspection-fail`：复检不通过（handler、remark 必填）
+- `POST /orders/{id}/scrap`：判定报废（handler、remark 必填）
+
+送检台后端测试：`InspectionWorkflowIntegrationTest`（14 个用例：重复送检并发、维修退回补充材料、复检不通过再复检、报废后不可发装/绑定/再送检、待归还直接报废拦截、送检期间正常归还、转入待处理、场次结束兜底联动、旧页面迟到操作 409、复检后重新送检新单、多页面状态一致性、open_key 唯一索引拦截、痕迹查询）。
+
 

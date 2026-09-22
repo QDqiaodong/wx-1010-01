@@ -2,6 +2,7 @@ package com.icepark.dto;
 
 import com.icepark.enums.AgeGroup;
 import com.icepark.enums.BindDispatchStatus;
+import com.icepark.enums.EquipmentStatus;
 import lombok.Data;
 
 import java.math.BigDecimal;
@@ -28,6 +29,14 @@ public class SessionDispatchItemDTO {
 
     private BindDispatchStatus dispatchStatus;
     private String dispatchStatusLabel;
+
+    /** 器材资产级状态（可用/使用中/送检中/已报废），多页面状态一致性以此为准 */
+    private EquipmentStatus equipmentStatus;
+    private String equipmentStatusLabel;
+
+    /** 未关闭送检单号与状态（无送检时为 null），现场可直接看到器材为何被冻结 */
+    private Long inspectionOrderId;
+    private String inspectionStatusLabel;
 
     /** 当前未归还流水ID（在架时为 null），归还直接用它 */
     private Long activeRecordId;

@@ -9,6 +9,8 @@ import com.icepark.entity.SessionEquipment;
 import com.icepark.enums.AgeGroup;
 import com.icepark.enums.BindDispatchStatus;
 import com.icepark.enums.EquipmentStatus;
+import com.icepark.exception.BusinessValidationException;
+import com.icepark.exception.ConflictException;
 import com.icepark.repository.AdjustRecordRepository;
 import com.icepark.repository.EquipmentRepository;
 import com.icepark.repository.SessionEquipmentRepository;
@@ -35,14 +37,17 @@ public class SessionEquipmentService {
     @Transactional
     public SessionEquipmentDTO bindEquipment(Long sessionId, Long equipmentId, String targetAgeGroup) {
         if (sessionEquipmentRepository.existsBySessionIdAndEquipmentId(sessionId, equipmentId)) {
-            throw new RuntimeException("该器材已绑定到场次");
+            throw new BusinessValidationException("该器材已绑定到场次");
         }
+
+        // 旧页面停留期间器材可能已被别人送检/报废：锁器材行读最新状态，
+        // 绑定绝不覆盖新状态（不依赖前端可用列表过滤）
+        Equipment equipment = equipmentRepository.findByIdForUpdate(equipmentId)
+                .orElseThrow(() -> new BusinessValidationException("器材不存在，ID: " + equipmentId));
+        assertEquipmentBindable(equipment);
 
         // 已在其他进行中场次发给游客且未归还的器材，不允许绑定到新场次
         equipmentDispatchService.assertEquipmentNotOutstanding(equipmentId);
-
-        Equipment equipment = equipmentRepository.findById(equipmentId)
-                .orElseThrow(() -> new RuntimeException("器材不存在，ID: " + equipmentId));
 
         SessionEquipment sessionEquipment = new SessionEquipment();
         sessionEquipment.setSessionId(sessionId);
@@ -52,10 +57,26 @@ public class SessionEquipmentService {
 
         SessionEquipment saved = sessionEquipmentRepository.save(sessionEquipment);
 
-        equipment.setStatus(EquipmentStatus.IN_USE);
-        equipmentRepository.save(equipment);
+        // 仅当器材当前是"可用"才置为使用中；送检/报废已在上面挡下
+        if (equipment.getStatus() == EquipmentStatus.AVAILABLE) {
+            equipment.setStatus(EquipmentStatus.IN_USE);
+            equipmentRepository.save(equipment);
+        }
 
         return convertToDTO(saved);
+    }
+
+    /** 绑定守卫：只有资产状态为"可用/使用中（已绑其他场次在架）"的器材允许绑定 */
+    private void assertEquipmentBindable(Equipment equipment) {
+        switch (equipment.getStatus()) {
+            case INSPECTION -> throw new ConflictException(
+                    "器材「" + equipment.getEquipmentCode() + "」已送检，单据未关闭前不能绑定到场次");
+            case SCRAPPED -> throw new ConflictException(
+                    "器材「" + equipment.getEquipmentCode() + "」已报废，不能绑定到场次");
+            case MAINTENANCE -> throw new ConflictException(
+                    "器材「" + equipment.getEquipmentCode() + "」处于维护中，不能绑定到场次");
+            default -> { /* AVAILABLE / IN_USE 允许 */ }
+        }
     }
     
     public List<SessionEquipmentDTO> getSessionEquipments(Long sessionId) {
@@ -75,13 +96,14 @@ public class SessionEquipmentService {
                 .orElseThrow(() -> new RuntimeException("该器材未绑定到场次"));
         
         sessionEquipmentRepository.delete(sessionEquipment);
-        
+
         Equipment equipment = equipmentRepository.findById(equipmentId).orElse(null);
         if (equipment != null) {
             boolean isUsedElsewhere = sessionEquipmentRepository.findByEquipmentId(equipmentId).stream()
                     .anyMatch(se -> !se.getSessionId().equals(sessionId));
-            
-            if (!isUsedElsewhere) {
+
+            // 送检中/已报废的资产状态只能由送检流程改变，解绑绝不复位
+            if (!isUsedElsewhere && equipment.getStatus() == EquipmentStatus.IN_USE) {
                 equipment.setStatus(EquipmentStatus.AVAILABLE);
                 equipmentRepository.save(equipment);
             }
@@ -209,15 +231,26 @@ public class SessionEquipmentService {
         int actualCount = Math.min(count, equipments.size());
         for (int i = 0; i < actualCount; i++) {
             Equipment equipment = equipments.get(i);
-            
+
+            // 自动绑定期间器材可能正被别人送检/报废：CAS 失败（0 行）直接跳过，不覆盖送检状态
+            int marked = equipmentRepository.markInUseIfAvailable(
+                    equipment.getId(), EquipmentStatus.AVAILABLE, EquipmentStatus.IN_USE);
+            if (marked == 0) {
+                continue;
+            }
+            // 再查一次未关闭送检单（open_key 已写入但状态切换时序的兜底）
+            if (equipmentDispatchService.hasOpenInspection(equipment.getId())) {
+                equipmentRepository.markAvailableIfInUse(
+                        equipment.getId(), EquipmentStatus.IN_USE, EquipmentStatus.AVAILABLE);
+                continue;
+            }
+
             SessionEquipment sessionEquipment = new SessionEquipment();
             sessionEquipment.setSessionId(sessionId);
             sessionEquipment.setEquipmentId(equipment.getId());
             sessionEquipment.setTargetAgeGroup(targetGroup);
+            sessionEquipment.setDispatchStatus(BindDispatchStatus.AVAILABLE);
             sessionEquipmentRepository.save(sessionEquipment);
-            
-            equipment.setStatus(EquipmentStatus.IN_USE);
-            equipmentRepository.save(equipment);
         }
     }
     

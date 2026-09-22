@@ -41,6 +41,24 @@ public interface EquipmentDispatchRecordRepository extends JpaRepository<Equipme
                     @Param("returnOperator") String returnOperator,
                     @Param("returnTime") java.time.LocalDateTime returnTime);
 
+    /**
+     * 游客无法归还时随送检单转入待处理：仍是 ISSUED 的流水置为 PENDING_TRANSFER 并释放互斥键，
+     * 条件更新返回 0 说明流水已被归还/兜底（旧页面并发）。
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE EquipmentDispatchRecord r SET r.status = com.icepark.enums.DispatchStatus.PENDING_TRANSFER, " +
+           "r.returnOperator = :operator, r.returnTime = :transferTime, r.outstandingKey = NULL " +
+           "WHERE r.id = :id AND r.status = com.icepark.enums.DispatchStatus.ISSUED")
+    int transferOutstanding(@Param("id") Long id,
+                            @Param("operator") String operator,
+                            @Param("transferTime") java.time.LocalDateTime transferTime);
+
+    /** 器材是否存在任何历史发装流水（用于删除器材时保留历史的守卫） */
+    boolean existsByEquipmentId(Long equipmentId);
+
     /** 归还完成后重新读取最新状态（关闭操作走的是批量 UPDATE） */
     Optional<EquipmentDispatchRecord> findByIdAndSessionId(Long id, Long sessionId);
+
+    Optional<EquipmentDispatchRecord> findFirstByEquipmentIdAndStatusOrderByIdDesc(Long equipmentId,
+                                                                                   DispatchStatus status);
 }

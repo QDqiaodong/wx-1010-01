@@ -8,7 +8,10 @@ import type {
   AgeGroup,
   SessionDispatchItem,
   EquipmentDispatchRecord,
-  IssueRequest
+  IssueRequest,
+  InspectionOrder,
+  InspectionCreateRequest,
+  InspectionActionRequest
 } from '@/types'
 
 const request = axios.create({
@@ -74,4 +77,26 @@ export const sessionEquipmentApi = {
 export const adjustRecordApi = {
   getAll: (): Promise<AdjustRecord[]> => request.get('/adjust-record'),
   getBySession: (sessionId: number): Promise<AdjustRecord[]> => request.get(`/adjust-record/session/${sessionId}`)
+}
+
+export const inspectionApi = {
+  listOrders: (params?: { equipmentId?: number; status?: string; openOnly?: boolean }): Promise<InspectionOrder[]> =>
+    request.get('/inspection/orders', { params }),
+  getOrder: (id: number): Promise<InspectionOrder> => request.get(`/inspection/orders/${id}`),
+  create: (equipmentId: number, data: InspectionCreateRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/equipment/${equipmentId}`, data),
+  transferPending: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/transfer-pending`, data),
+  requestInfo: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/request-info`, data),
+  resubmit: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/resubmit`, data),
+  submitReinspection: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/submit-reinspection`, data),
+  reinspectionPass: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/reinspection-pass`, data),
+  reinspectionFail: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/reinspection-fail`, data),
+  scrap: (id: number, data: InspectionActionRequest): Promise<InspectionOrder> =>
+    request.post(`/inspection/orders/${id}/scrap`, data)
 }

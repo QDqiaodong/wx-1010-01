@@ -5,7 +5,11 @@ import com.icepark.dto.AgeGroupSummaryDTO;
 import com.icepark.entity.Equipment;
 import com.icepark.enums.AgeGroup;
 import com.icepark.enums.EquipmentStatus;
+import com.icepark.exception.BusinessValidationException;
+import com.icepark.exception.ConflictException;
+import com.icepark.repository.EquipmentDispatchRecordRepository;
 import com.icepark.repository.EquipmentRepository;
+import com.icepark.repository.InspectionOrderRepository;
 import com.alibaba.fastjson.JSON;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,6 +26,8 @@ import java.util.stream.Collectors;
 public class EquipmentService {
     
     private final EquipmentRepository equipmentRepository;
+    private final EquipmentDispatchRecordRepository dispatchRecordRepository;
+    private final InspectionOrderRepository inspectionOrderRepository;
     private final RedisTemplate<String, Object> redisTemplate;
     
     private static final String REDIS_KEY_FROST_PARAMS = "equipment:frost_params";
@@ -42,7 +48,7 @@ public class EquipmentService {
     
     public EquipmentDTO getEquipmentById(Long id) {
         Equipment equipment = equipmentRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("器材不存在，ID: " + id));
+                .orElseThrow(() -> new BusinessValidationException("器材不存在，ID: " + id));
         return convertToDTO(equipment);
     }
     
@@ -58,8 +64,8 @@ public class EquipmentService {
         equipment.setFrostResistanceSpec(dto.getFrostResistanceSpec());
         equipment.setAgeGroup(AgeGroup.valueOf(dto.getAgeGroup().toUpperCase()));
         equipment.setCategory(dto.getCategory());
-        equipment.setStatus(dto.getStatus() != null ? 
-                EquipmentStatus.valueOf(dto.getStatus().toUpperCase()) : EquipmentStatus.AVAILABLE);
+        // 资产状态只能走"送检→复检/报废"状态机，新建一律可用，忽略表单传入的状态
+        equipment.setStatus(EquipmentStatus.AVAILABLE);
         
         Equipment saved = equipmentRepository.save(equipment);
         updateRedisCache();
@@ -83,9 +89,8 @@ public class EquipmentService {
         equipment.setFrostResistanceSpec(dto.getFrostResistanceSpec());
         equipment.setAgeGroup(AgeGroup.valueOf(dto.getAgeGroup().toUpperCase()));
         equipment.setCategory(dto.getCategory());
-        if (dto.getStatus() != null) {
-            equipment.setStatus(EquipmentStatus.valueOf(dto.getStatus().toUpperCase()));
-        }
+        // 不允许通过编辑表单直接改资产状态：送检中/已报废等只能由送检流程驱动，避免绕过状态机
+        // （equipment.status 保持数据库现值不变）
         
         Equipment saved = equipmentRepository.save(equipment);
         updateRedisCache();
@@ -94,10 +99,18 @@ public class EquipmentService {
     
     @Transactional
     public void deleteEquipment(Long id) {
-        if (!equipmentRepository.existsById(id)) {
-            throw new RuntimeException("器材不存在，ID: " + id);
+        Equipment equipment = equipmentRepository.findById(id)
+                .orElseThrow(() -> new BusinessValidationException("器材不存在，ID: " + id));
+        // 有发装流水或送检历史的器材必须保留审计痕迹，只能报废不能物理删除
+        if (dispatchRecordRepository.existsByEquipmentId(id)) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode()
+                    + "」存在发装/归还流水，不能删除（如不再使用请走送检报废流程）");
         }
-        equipmentRepository.deleteById(id);
+        if (!inspectionOrderRepository.findByEquipmentIdOrderByReportTimeDescIdDesc(id).isEmpty()) {
+            throw new ConflictException("器材「" + equipment.getEquipmentCode()
+                    + "」存在送检记录，历史必须保留，不能删除");
+        }
+        equipmentRepository.delete(equipment);
         updateRedisCache();
     }
     

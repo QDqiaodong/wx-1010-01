@@ -10,7 +10,7 @@ import type {
   IssueRequest
 } from '@/types'
 import { AGE_GROUP_MAP, SESSION_STATUS_MAP } from '@/types'
-import { sessionApi, dispatchApi } from '@/api'
+import { sessionApi, dispatchApi, inspectionApi } from '@/api'
 
 const route = useRoute()
 
@@ -41,6 +41,7 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const issuedCount = computed(() => items.value.filter(i => i.dispatchStatus === 'ISSUED').length)
 const availableCount = computed(() => items.value.filter(i => i.dispatchStatus === 'AVAILABLE').length)
+const pendingCount = computed(() => items.value.filter(i => i.dispatchStatus === 'PENDING').length)
 
 const ageGroupOptions = Object.entries(AGE_GROUP_MAP).map(([value, data]) => ({
   label: data.label,
@@ -176,7 +177,11 @@ const handleReturn = async (item: SessionDispatchItem) => {
   returningId.value = item.activeRecordId
   try {
     await dispatchApi.returnEquipment(currentSessionId.value, item.activeRecordId, operator.value.trim())
-    ElMessage.success(`归还成功：${item.equipmentCode}（${item.activeVisitorName}），器材已重新可领用`)
+    ElMessage.success(
+      item.inspectionOrderId
+        ? `归还成功：${item.equipmentCode}（${item.activeVisitorName}）。该器材已送检，归还后直接进入维修队列`
+        : `归还成功：${item.equipmentCode}（${item.activeVisitorName}），器材已重新可领用`
+    )
     await loadData()
   } catch (e: any) {
     ElMessage({ type: 'error', message: e?.response?.data?.error || '归还失败' })
@@ -185,12 +190,46 @@ const handleReturn = async (item: SessionDispatchItem) => {
   }
 }
 
+// ---------- 送检待归还：游客无法归还时转入待处理 ----------
+const transferringId = ref<number | null>(null)
+const handleTransferPending = async (item: SessionDispatchItem) => {
+  if (!item.inspectionOrderId) return
+  if (!operator.value.trim()) {
+    ElMessage.error('请先在顶部填写操作员')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `游客「${item.activeVisitorName}」确认无法归还器材「${item.equipmentCode}」？转入后原发装流水闭环，器材随送检单进入维修队列。`,
+      '转入待处理',
+      { type: 'warning', confirmButtonText: '确认转入待处理', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  transferringId.value = item.inspectionOrderId
+  try {
+    await inspectionApi.transferPending(item.inspectionOrderId, {
+      handler: operator.value.trim(),
+      remark: `现场转入待处理，原游客 ${item.activeVisitorName || '—'} 未归还`
+    })
+    ElMessage.success('已转入待处理，流水已闭环，器材进入维修队列')
+    await loadData()
+  } catch (e: any) {
+    ElMessage({ type: e?.response?.status === 409 ? 'warning' : 'error', message: e?.response?.data?.error || '转入失败' })
+  } finally {
+    transferringId.value = null
+  }
+}
+
 const dispatchTagType = (status: string) =>
   status === 'ISSUED'
     ? 'warning'
     : status === 'RETURNED'
       ? 'success'
-      : 'info'
+      : status === 'PENDING_TRANSFER'
+        ? 'warning'
+        : 'info'
 
 const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
 </script>
@@ -232,7 +271,7 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
             <el-tag :type="inProgress ? 'success' : 'info'" class="ml">
               {{ SESSION_STATUS_MAP[currentSession.status] }}
             </el-tag>
-            <span class="ml">在架 <b>{{ availableCount }}</b> 件 / 已领用 <b>{{ issuedCount }}</b> 件</span>
+            <span class="ml">在架 <b>{{ availableCount }}</b> 件 / 已领用 <b>{{ issuedCount }}</b> 件<template v-if="pendingCount > 0"> / 送检冻结 <b>{{ pendingCount }}</b> 件</template></span>
             <div class="spacer" />
             <el-button
               v-if="currentSession.status === 'SCHEDULED'"
@@ -298,9 +337,25 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
           </el-table-column>
           <el-table-column label="发装状态" width="100">
             <template #default="{ row }">
-              <el-tag :type="row.dispatchStatus === 'ISSUED' ? 'warning' : 'success'">
+              <el-tag :type="row.dispatchStatus === 'ISSUED' ? 'warning' : row.dispatchStatus === 'PENDING' ? 'danger' : 'success'">
                 {{ row.dispatchStatusLabel }}
               </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="资产/送检" width="130">
+            <template #default="{ row }">
+              <el-tag
+                size="small"
+                :type="row.equipmentStatus === 'INSPECTION' ? 'danger' : row.equipmentStatus === 'SCRAPPED' ? 'info' : 'success'"
+              >
+                {{ row.equipmentStatusLabel || '—' }}
+              </el-tag>
+              <div v-if="row.inspectionOrderId" class="inspect-line">
+                <el-link type="warning" :underline="false" @click="$router.push({ path: '/inspection', query: { equipmentId: String(row.equipmentId) } })">
+                  送检单#{{ row.inspectionOrderId }}
+                </el-link>
+                <span class="muted">（{{ row.inspectionStatusLabel }}）</span>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="当前使用游客" min-width="180">
@@ -308,11 +363,15 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
               <template v-if="row.dispatchStatus === 'ISSUED'">
                 {{ row.activeVisitorName }}
                 <el-tag size="small" class="ml">{{ row.activeVisitorAgeGroupLabel }}</el-tag>
+                <el-tag v-if="row.inspectionOrderId" size="small" type="warning" class="ml">已送检·待归还</el-tag>
               </template>
+              <span v-else-if="row.dispatchStatus === 'PENDING'" class="muted">
+                送检冻结{{ row.inspectionStatusLabel ? `（${row.inspectionStatusLabel}）` : '' }}
+              </span>
               <span v-else class="muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="150" fixed="right">
+          <el-table-column label="操作" width="210" fixed="right">
             <template #default="{ row }">
               <el-button
                 v-if="row.dispatchStatus === 'AVAILABLE'"
@@ -321,13 +380,23 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
                 :disabled="!inProgress"
                 @click="openIssueDialog(row)"
               >发装</el-button>
-              <el-button
-                v-else
-                size="small"
-                type="success"
-                :loading="returningId === row.activeRecordId"
-                @click="handleReturn(row)"
-              >归还</el-button>
+              <template v-else-if="row.dispatchStatus === 'ISSUED'">
+                <el-button
+                  size="small"
+                  type="success"
+                  :loading="returningId === row.activeRecordId"
+                  @click="handleReturn(row)"
+                >归还</el-button>
+                <el-button
+                  v-if="row.inspectionOrderId"
+                  size="small"
+                  type="warning"
+                  plain
+                  :loading="transferringId === row.inspectionOrderId"
+                  @click="handleTransferPending(row)"
+                >转入待处理</el-button>
+              </template>
+              <el-button v-else size="small" disabled>不可发装</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -457,5 +526,11 @@ const fmtTime = (t?: string) => (t ? t.replace('T', ' ').slice(0, 19) : '—')
 
 .muted {
   color: #c0c4cc;
+}
+
+.inspect-line {
+  margin-top: 2px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 </style>
